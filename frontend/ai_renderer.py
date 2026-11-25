@@ -1,244 +1,244 @@
 
-import os
-import tempfile
-import streamlit as st
-
+import base64
 from io import BytesIO
-from PIL import Image
-from gradio_client import Client, handle_file
 
-from ai_engine.prompt_builder import build_prompt
-from ai_engine.gemini_service import analyze_landscape_sketch
+import requests
+import streamlit as st
+from PIL import Image, ImageOps
+
+
+MODEL_ID = "@cf/black-forest-labs/flux-2-klein-9b"
+
+STYLES = {
+    "Modern Minimalist": "modern minimalist garden, geometric planting beds, clean stone paving, elegant architectural landscaping",
+    "Tropical Paradise": "lush tropical garden, palms, exotic foliage, vibrant flowering plants, natural stone",
+    "Japanese Zen": "peaceful Japanese garden, koi pond, Japanese maple, bamboo, stone lanterns and stepping stones",
+    "Mediterranean": "Mediterranean garden, olive trees, lavender, terracotta, warm natural stone",
+    "Luxury Contemporary": "luxury contemporary landscape, premium outdoor furniture, elegant lighting, sophisticated planting",
+    "Natural Cottage": "English cottage garden, colorful flowers, curved paths, layered shrubs and natural planting"
+}
+
+
+def generate_cloudflare_image(sketch, prompt, style):
+
+    account_id = st.secrets.get("CLOUDFLARE_ACCOUNT_ID")
+    api_token = st.secrets.get("CLOUDFLARE_API_TOKEN")
+
+    if not account_id or not api_token:
+        raise ValueError("Cloudflare credentials are missing from Streamlit Secrets.")
+
+    endpoint = (
+        f"https://api.cloudflare.com/client/v4/accounts/"
+        f"{account_id}/ai/run/{MODEL_ID}"
+    )
+
+    # Prepare reference image.
+    # Cloudflare requires reference images smaller than 512 x 512.
+    sketch = ImageOps.exif_transpose(sketch).convert("RGB")
+    sketch.thumbnail((511, 511), Image.Resampling.LANCZOS)
+
+    image_buffer = BytesIO()
+    sketch.save(image_buffer, format="PNG")
+    image_bytes = image_buffer.getvalue()
+
+    full_prompt = f"""
+    Transform the supplied garden pencil sketch into a premium,
+    photorealistic landscape architecture visualization.
+
+    SELECTED STYLE:
+    {STYLES[style]}
+
+    USER REQUIREMENTS:
+    {prompt if prompt.strip() else "Create a beautiful, professionally landscaped garden."}
+
+    REFERENCE IMAGE INSTRUCTIONS:
+    Use the uploaded sketch as the primary visual reference.
+    Preserve its garden boundaries, overall composition,
+    pathways, pond positions, bridges, seating areas,
+    buildings and visible structures.
+
+    Do not invent a completely different garden.
+    Do not remove major structures from the reference.
+    Add realistic materials, detailed healthy vegetation,
+    natural water, realistic grass and professional lighting.
+
+    VISUAL QUALITY:
+    High-end architectural landscape photography,
+    natural daylight, realistic shadows, balanced colors,
+    detailed textures and professional visualization.
+    """
+
+    data = {
+        "prompt": full_prompt,
+        "width": "1024",
+        "height": "1024",
+        "guidance": "4"
+    }
+
+    files = {
+        "input_image_0": (
+            "garden_sketch.png",
+            image_bytes,
+            "image/png"
+        )
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_token}"
+    }
+
+    response = requests.post(
+        endpoint,
+        headers=headers,
+        data=data,
+        files=files,
+        timeout=300
+    )
+
+    if response.status_code != 200:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:1000]
+
+        raise RuntimeError(
+            f"Cloudflare API error ({response.status_code}): {detail}"
+        )
+
+    result = response.json()
+
+    if not result.get("success", True):
+        raise RuntimeError(str(result.get("errors", result)))
+
+    image_data = result.get("result", {}).get("image")
+
+    if not image_data:
+        raise RuntimeError(
+            f"No generated image returned. Response: {result}"
+        )
+
+    generated_bytes = base64.b64decode(image_data)
+    generated_image = Image.open(
+        BytesIO(generated_bytes)
+    ).convert("RGB")
+
+    return generated_image
 
 
 def show_ai_renderer():
 
-    st.markdown("""
-        <div class="main-title">🌿 GardenForge AI</div>
+    st.markdown(
+        """
+        <div class="main-title">GardenForge AI 🌿</div>
         <div class="subtitle">
-            Transform your pencil sketches into customized
-            photorealistic landscape concepts.
+        Transform pencil sketches into customized,
+        photorealistic landscape designs.
         </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # Kaggle Gradio connection
-    api_url = st.text_input(
-        "Kaggle GPU API URL",
-        value=os.getenv("GARDENFORGE_API_URL", ""),
-        placeholder="Paste your https://....gradio.live address",
-        key="gardenforge_api_url"
+        """,
+        unsafe_allow_html=True
     )
 
-    st.markdown("### 1. Upload Your Original Garden Sketch")
+    st.divider()
 
-    uploaded = st.file_uploader(
-        "Choose a pencil sketch or garden drawing",
+    st.markdown("### 1. Upload Your Garden Sketch")
+
+    uploaded_file = st.file_uploader(
+        "Upload a pencil sketch or garden drawing",
         type=["png", "jpg", "jpeg"],
-        key="direct_garden_sketch"
+        key="cloudflare_garden_upload"
     )
 
-    sketch = None
-
-    if uploaded is not None:
-        sketch = Image.open(
-            BytesIO(uploaded.getvalue())
-        ).convert("RGB")
-
-        # A new upload means a new generation
-        upload_id = uploaded.name + str(uploaded.size)
-
-        if st.session_state.get("renderer_upload_id") != upload_id:
-            st.session_state.renderer_upload_id = upload_id
-            st.session_state.gemini_analysis = None
-            st.session_state.generated_image = None
-            st.session_state.renderer_prompt = None
-
-    else:
-        sketch = st.session_state.get("original_sketch")
-
-        if sketch is None:
-            sketch = st.session_state.get("processed_sketch")
-
-    if sketch is None:
+    if uploaded_file is None:
         st.info("Upload a garden sketch to begin.")
         return
 
+    sketch = Image.open(uploaded_file).convert("RGB")
+
     st.image(
         sketch,
-        caption="Original Garden Sketch",
+        caption="Your original garden sketch",
         use_container_width=True
     )
 
-    st.markdown("---")
     st.markdown("### 2. Customize Your Garden")
 
     style = st.selectbox(
         "Choose Landscape Style",
-        [
-            "Modern Minimalist",
-            "Tropical Paradise",
-            "Japanese Zen",
-            "Mediterranean",
-            "Luxury Contemporary",
-            "Natural Cottage"
-        ],
-        key="renderer_style"
+        list(STYLES.keys()),
+        key="cloudflare_garden_style"
     )
 
     custom_prompt = st.text_area(
-        "Describe the changes you want",
+        "Describe your dream garden",
         placeholder=(
-            "Example: Add a swimming pool, tropical plants, "
-            "colorful flowers, outdoor seating and warm lighting."
+            "Example: Add a swimming pool, colorful flowers, "
+            "wooden seating, tropical plants and warm lighting."
         ),
         height=120,
-        key="renderer_custom_prompt"
+        key="cloudflare_garden_prompt"
     )
 
-    guidance = st.slider(
-        "Prompt Guidance",
-        min_value=5.0,
-        max_value=12.0,
-        value=7.5,
-        step=0.5,
-        key="renderer_guidance"
+    st.markdown("### 3. Generate Your HD Landscape")
+
+    st.caption(
+        "Powered by Cloudflare Workers AI and FLUX.2 Klein 9B."
     )
 
-    st.markdown("---")
-    st.markdown("### 3. Gemini Sketch Analysis")
-
     if st.button(
-        "🔍 Analyze Sketch with Gemini",
-        use_container_width=True
-    ):
-        try:
-            with st.spinner("Gemini is analyzing your garden..."):
-                analysis = analyze_landscape_sketch(sketch)
-                st.session_state.gemini_analysis = analysis
-
-            st.success("Sketch analysis completed!")
-
-        except Exception as error:
-            st.error(f"Gemini analysis failed: {error}")
-
-    analysis = st.session_state.get("gemini_analysis")
-
-    if analysis:
-        with st.expander("View Gemini Analysis"):
-            st.write(analysis)
-
-    st.markdown("---")
-    st.markdown("### 4. Generate Your HD Landscape")
-
-    if st.button(
-        "✨ Generate GardenForge Landscape",
+        "✨ Generate 1024 × 1024 Landscape",
         type="primary",
         use_container_width=True
     ):
 
-        if not api_url.strip():
-            st.error("Paste your active Kaggle Gradio API URL first.")
+        try:
+            with st.spinner(
+                "GardenForge AI is transforming your sketch..."
+            ):
+                generated = generate_cloudflare_image(
+                    sketch,
+                    custom_prompt,
+                    style
+                )
 
-        else:
-            try:
-                with st.spinner("Preparing your garden design..."):
+            st.session_state["generated_image"] = generated
+            st.session_state["garden_original"] = sketch
 
-                    if not analysis:
-                        analysis = analyze_landscape_sketch(sketch)
-                        st.session_state.gemini_analysis = analysis
+            st.success("Your landscape design is ready!")
 
-                    prompt = build_prompt(
-                        analysis,
-                        style,
-                        custom_prompt
-                    )
+        except Exception as error:
+            st.error(f"Generation failed: {error}")
 
-                    st.session_state.renderer_prompt = prompt
-
-                with tempfile.NamedTemporaryFile(
-                    suffix=".png",
-                    delete=False
-                ) as temp_file:
-
-                    sketch.save(temp_file, format="PNG")
-                    sketch_path = temp_file.name
-
-                try:
-                    with st.spinner(
-                        "Kaggle T4 GPU is generating your landscape..."
-                    ):
-
-                        client = Client(api_url.strip())
-
-                        result = client.predict(
-                            handle_file(sketch_path),
-                            prompt,
-                            style,
-                            guidance,
-                            api_name="/generate_garden"
-                        )
-
-                finally:
-                    if os.path.exists(sketch_path):
-                        os.remove(sketch_path)
-
-                if isinstance(result, (tuple, list)):
-                    result = result[0]
-
-                if isinstance(result, dict):
-                    result = (
-                        result.get("path")
-                        or result.get("name")
-                        or result.get("url")
-                    )
-
-                if isinstance(result, Image.Image):
-                    generated = result.convert("RGB")
-                else:
-                    generated = Image.open(result).convert("RGB")
-
-                st.session_state.generated_image = generated
-                st.session_state.generated_prompt = prompt
-                st.session_state.generated_style = style
-
-                st.success("Your GardenForge landscape is ready!")
-
-            except Exception as error:
-                st.error(f"Landscape generation failed: {error}")
-
-    # 5. Display result
     generated = st.session_state.get("generated_image")
 
     if generated is not None:
 
-        st.markdown("---")
-        st.markdown("## 🌿 Before & After Comparison")
+        st.divider()
+        st.markdown("## 4. Your GardenForge Design")
 
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("### Original Sketch")
-            st.image(sketch, use_container_width=True)
+            st.markdown("**Original Sketch**")
+            original = st.session_state.get(
+                "garden_original", sketch
+            )
+            st.image(original, use_container_width=True)
 
         with col2:
-            st.markdown("### AI-Generated Design")
+            st.markdown("**AI-Generated Landscape**")
             st.image(generated, use_container_width=True)
 
-        st.markdown("### Download Your Landscape")
+        st.success(
+            f"Output resolution: {generated.width} × {generated.height}"
+        )
 
         buffer = BytesIO()
         generated.save(buffer, format="PNG")
 
         st.download_button(
-            "⬇️ Download HD Landscape",
+            "⬇️ Download HD Garden Design",
             data=buffer.getvalue(),
-            file_name="GardenForge_HD_Landscape.png",
+            file_name="GardenForge_HD_1024.png",
             mime="image/png",
             use_container_width=True
-        )
-
-        st.success(
-            f"Export resolution: {generated.width} × {generated.height}"
         )
